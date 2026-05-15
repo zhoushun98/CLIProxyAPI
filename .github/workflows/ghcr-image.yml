@@ -1,0 +1,203 @@
+name: ghcr-image
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/FUNDING.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Extra image tag (optional, e.g. v7.0.0)'
+        required: false
+        type: string
+
+env:
+  APP_NAME: CLIProxyAPI
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  docker_amd64:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Refresh models catalog
+        run: |
+          git fetch --depth 1 https://github.com/router-for-me/models.git main
+          git show FETCH_HEAD:models.json > internal/registry/models/models.json
+      - name: Lowercase image name
+        id: img
+        run: echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate Build Metadata
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "VERSION=${{ inputs.tag }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=sha-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          fi
+          echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
+          echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
+          echo "IMG=${{ env.REGISTRY }}/${{ steps.img.outputs.name }}" >> $GITHUB_ENV
+      - name: Build and push (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ env.COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          tags: |
+            ${{ env.IMG }}:latest-amd64
+            ${{ env.IMG }}:${{ env.VERSION }}-amd64
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,scope=amd64,mode=max
+
+  docker_arm64:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Refresh models catalog
+        run: |
+          git fetch --depth 1 https://github.com/router-for-me/models.git main
+          git show FETCH_HEAD:models.json > internal/registry/models/models.json
+      - name: Lowercase image name
+        id: img
+        run: echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate Build Metadata
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "VERSION=${{ inputs.tag }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=sha-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          fi
+          echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
+          echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
+          echo "IMG=${{ env.REGISTRY }}/${{ steps.img.outputs.name }}" >> $GITHUB_ENV
+      - name: Build and push (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ env.COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          tags: |
+            ${{ env.IMG }}:latest-arm64
+            ${{ env.IMG }}:${{ env.VERSION }}-arm64
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,scope=arm64,mode=max
+
+  docker_manifest:
+    runs-on: ubuntu-latest
+    needs:
+      - docker_amd64
+      - docker_arm64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Lowercase image name
+        id: img
+        run: echo "name=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate Build Metadata
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "VERSION=${{ inputs.tag }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=sha-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          fi
+          echo "IMG=${{ env.REGISTRY }}/${{ steps.img.outputs.name }}" >> $GITHUB_ENV
+      - name: Create and push multi-arch manifests
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMG}:latest" \
+            "${IMG}:latest-amd64" \
+            "${IMG}:latest-arm64"
+          docker buildx imagetools create \
+            --tag "${IMG}:${VERSION}" \
+            "${IMG}:${VERSION}-amd64" \
+            "${IMG}:${VERSION}-arm64"
+      - name: Cleanup temporary per-arch tags
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          pkg="${GITHUB_REPOSITORY#*/}"
+          pkg_lc="$(echo "${pkg}" | tr '[:upper:]' '[:lower:]')"
+
+          # GHCR packages live under either /users/{owner} or /orgs/{owner} depending on account type
+          owner_type="$(gh api "/users/${owner}" --jq .type 2>/dev/null || echo "User")"
+          if [ "${owner_type}" = "Organization" ]; then
+            base="/orgs/${owner}/packages/container/${pkg_lc}"
+          else
+            base="/users/${owner}/packages/container/${pkg_lc}"
+          fi
+
+          delete_tag() {
+            local tag="$1"
+            local ids
+            ids="$(gh api --paginate "${base}/versions" --jq ".[] | select(.metadata.container.tags[]? == \"${tag}\") | .id" || true)"
+            if [ -z "${ids}" ]; then
+              echo "No version found for tag ${tag}"
+              return 0
+            fi
+            for id in ${ids}; do
+              if gh api -X DELETE "${base}/versions/${id}" >/dev/null 2>&1; then
+                echo "Deleted version ${id} (tag ${tag})"
+              else
+                echo "Failed to delete version ${id} (tag ${tag})"
+              fi
+            done
+          }
+
+          delete_tag "latest-amd64"
+          delete_tag "latest-arm64"
+          delete_tag "${VERSION}-amd64"
+          delete_tag "${VERSION}-arm64"
