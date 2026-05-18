@@ -115,7 +115,7 @@ func (p *prober) applyResult(authID string, result ProbeResult, probeErr error, 
 		// the auth with the conductor.
 		dst, errUnpark := p.mover.Unpark(authID)
 		if errUnpark != nil {
-			log.WithFields(log.Fields{"auth_id": authID, "err": errUnpark.Error()}).Warn("quota-park: unpark failed |")
+			log.Warnf("quota-park: unpark failed | auth_id=%s error=%s", authID, errUnpark.Error())
 			// Stash the failure on the entry so it does not loop tightly.
 			p.state.Update(authID, func(info *ParkedInfo) {
 				info.LastProbeAt = now
@@ -126,7 +126,7 @@ func (p *prober) applyResult(authID string, result ProbeResult, probeErr error, 
 		}
 		p.tracker.StartGrace(authID, now)
 		p.state.Delete(authID)
-		log.WithFields(log.Fields{"auth_id": authID, "path": dst}).Info("quota-park: unparking |")
+		log.Infof("quota-park: unparking | auth_id=%s path=%s", authID, dst)
 		return
 
 	case ProbeStillExhausted:
@@ -139,7 +139,7 @@ func (p *prober) applyResult(authID string, result ProbeResult, probeErr error, 
 				info.CurrentProbeInterval = defaultInterval
 			}
 		})
-		log.WithFields(log.Fields{"auth_id": authID}).Debug("quota-park: probe still-429 |")
+		log.Debugf("quota-park: probe still-429 | auth_id=%s", authID)
 		return
 
 	case ProbeAuthError:
@@ -154,7 +154,7 @@ func (p *prober) applyResult(authID string, result ProbeResult, probeErr error, 
 			info.ConsecutiveProbeFailures++
 			info.CurrentProbeInterval = nextBackoff(info, defaultInterval)
 		})
-		log.WithFields(log.Fields{"auth_id": authID, "err": msg}).Warn("quota-park: probe auth-error |")
+		log.Warnf("quota-park: probe auth-error | auth_id=%s error=%s", authID, msg)
 		return
 
 	case ProbeSkipUnsupported:
@@ -164,7 +164,8 @@ func (p *prober) applyResult(authID string, result ProbeResult, probeErr error, 
 			info.LastProbeErr = "unsupported provider"
 			info.CurrentProbeInterval = proberFailureLongInterval
 		})
-		log.WithFields(log.Fields{"auth_id": authID, "provider": authProvider(p.state, authID)}).Debug("quota-park: probe unsupported provider, parked indefinitely |")
+		log.Debugf("quota-park: probe unsupported provider, parked indefinitely | auth_id=%s provider=%s",
+			authID, authProvider(p.state, authID))
 		return
 
 	default: // ProbeError, ProbeUnknown
@@ -179,7 +180,7 @@ func (p *prober) applyResult(authID string, result ProbeResult, probeErr error, 
 			info.ConsecutiveProbeFailures++
 			info.CurrentProbeInterval = nextBackoff(info, defaultInterval)
 		})
-		log.WithFields(log.Fields{"auth_id": authID, "err": msg}).Warn("quota-park: probe error |")
+		log.Warnf("quota-park: probe error | auth_id=%s error=%s", authID, msg)
 	}
 }
 

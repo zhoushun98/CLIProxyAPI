@@ -110,7 +110,7 @@ func (s *Service) NoticeRestored(authID string) {
 	}
 	s.state.Delete(authID)
 	s.tracker.StartGrace(authID, time.Now())
-	log.WithFields(log.Fields{"auth_id": authID}).Info("quota-park: noticed manual restore |")
+	log.Infof("quota-park: noticed manual restore | auth_id=%s", authID)
 }
 
 // RebuildFromDisk scans <parkedDir>/*.json and populates the in-memory state
@@ -149,7 +149,7 @@ func (s *Service) RebuildFromDisk() error {
 		count++
 	}
 	if count > 0 {
-		log.WithFields(log.Fields{"parked": count}).Info("quota-park: rebuilt state from disk |")
+		log.Infof("quota-park: rebuilt state from disk | parked=%d", count)
 	}
 	return nil
 }
@@ -169,14 +169,14 @@ func (s *Service) Start(ctx context.Context) {
 	s.cancel = cancel
 	s.mu.Unlock()
 
-	log.WithFields(log.Fields{
-		"window":            s.cfg.QuotaPark.Trigger.Window,
-		"count":             s.cfg.QuotaPark.Trigger.Count,
-		"interval":          s.cfg.QuotaPark.Probe.Interval,
-		"grace-after-unpark": s.cfg.QuotaPark.Trigger.GraceAfterUnpark,
-		"dir":               s.cfg.QuotaPark.Directory,
-		"model":             s.cfg.QuotaPark.Probe.Model,
-	}).Info("quota-park: enabled |")
+	log.Infof("quota-park: enabled | window=%s count=%d grace-after-unpark=%s interval=%s dir=%s model=%s",
+		s.cfg.QuotaPark.Trigger.Window,
+		s.cfg.QuotaPark.Trigger.Count,
+		s.cfg.QuotaPark.Trigger.GraceAfterUnpark,
+		s.cfg.QuotaPark.Probe.Interval,
+		s.cfg.QuotaPark.Directory,
+		s.cfg.QuotaPark.Probe.Model,
+	)
 
 	s.wg.Add(1)
 	go func() {
@@ -209,15 +209,12 @@ func (s *Service) observe429(authID, provider, model string, at time.Time) bool 
 		}
 	}
 	if s.state.Has(authID) {
-		log.WithFields(log.Fields{"auth_id": authID}).Debug("quota-park: park no-op already parked |")
+		log.Debugf("quota-park: park no-op already parked | auth_id=%s", authID)
 		return false
 	}
 	if !s.tracker.Observe429(authID, at) {
-		log.WithFields(log.Fields{
-			"auth_id": authID,
-			"count":   s.tracker.hitCount(authID),
-			"window":  s.cfg.QuotaPark.Trigger.Window,
-		}).Debug("quota-park: tracker hit |")
+		log.Debugf("quota-park: tracker hit | auth_id=%s count=%d window=%s",
+			authID, s.tracker.hitCount(authID), s.cfg.QuotaPark.Trigger.Window)
 		return false
 	}
 	return s.performPark(authID, provider, model, at)
@@ -227,12 +224,12 @@ func (s *Service) observe429(authID, provider, model string, at time.Time) bool 
 // an authID that is already parked returns false without side effects.
 func (s *Service) performPark(authID, provider, model string, at time.Time) bool {
 	if s.state.Has(authID) {
-		log.WithFields(log.Fields{"auth_id": authID}).Debug("quota-park: park no-op already parked |")
+		log.Debugf("quota-park: park no-op already parked | auth_id=%s", authID)
 		return false
 	}
 	parkedPath, err := s.mover.Park(authID)
 	if err != nil {
-		log.WithFields(log.Fields{"auth_id": authID, "err": err.Error()}).Warn("quota-park: park rename failed |")
+		log.Warnf("quota-park: park rename failed | auth_id=%s error=%s", authID, err.Error())
 		return false
 	}
 	info := ParkedInfo{
@@ -245,11 +242,7 @@ func (s *Service) performPark(authID, provider, model string, at time.Time) bool
 	s.state.Put(info)
 	// Reset the 429 ring buffer so a future unpark starts from scratch.
 	s.tracker.Reset(authID)
-	log.WithFields(log.Fields{
-		"auth_id": authID,
-		"model":   model,
-		"path":    parkedPath,
-	}).Info("quota-park: parking |")
+	log.Infof("quota-park: parking | auth_id=%s model=%s path=%s", authID, model, parkedPath)
 	return true
 }
 
