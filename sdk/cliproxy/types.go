@@ -89,6 +89,7 @@ type WatcherWrapper struct {
 	snapshotAuths         func() []*coreauth.Auth
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
 	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
+	setAuthRestoredCb     func(cb func(authID string))
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -113,6 +114,16 @@ func (w *WatcherWrapper) SetConfig(cfg *config.Config) {
 		return
 	}
 	w.setConfig(cfg)
+}
+
+// SetAuthRestoredCallback registers a callback invoked when an auth file is
+// added or updated under the auth directory. Used by quotapark to detect when
+// a previously parked auth is restored. Passing nil clears the callback.
+func (w *WatcherWrapper) SetAuthRestoredCallback(cb func(authID string)) {
+	if w == nil || w.setAuthRestoredCb == nil {
+		return
+	}
+	w.setAuthRestoredCb(cb)
 }
 
 // DispatchRuntimeAuthUpdate forwards runtime auth updates (e.g., websocket providers)

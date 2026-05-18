@@ -229,10 +229,21 @@ func (w *Watcher) addOrUpdateClient(path string) {
 		delete(w.fileAuthsByPath, normalized)
 	}
 	updates := w.computePerPathUpdatesLocked(oldByID, newByID)
+	restoredCb := w.authRestoredCb
+	restoredIDs := make([]string, 0, len(newByID))
+	for id := range newByID {
+		restoredIDs = append(restoredIDs, id)
+	}
 	w.clientsMutex.Unlock()
 
 	w.persistAuthAsync(fmt.Sprintf("Sync auth %s", filepath.Base(path)), path)
 	w.dispatchAuthUpdates(updates)
+
+	if restoredCb != nil {
+		for _, id := range restoredIDs {
+			restoredCb(id)
+		}
+	}
 }
 
 func (w *Watcher) removeClient(path string) {

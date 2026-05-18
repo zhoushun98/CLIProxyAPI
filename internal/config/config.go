@@ -92,6 +92,11 @@ type Config struct {
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
 
+	// QuotaPark controls automatic quarantine-and-probe behavior for OAuth auth
+	// files that repeatedly receive HTTP 429. Disabled by default; opt-in via
+	// 'quota-park.enabled'.
+	QuotaPark QuotaPark `yaml:"quota-park" json:"quota-park"`
+
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
@@ -204,6 +209,45 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+}
+
+// QuotaPark configures the quota-park feature: when an OAuth auth file
+// repeatedly receives HTTP 429, move it to a parking subdirectory and
+// periodically probe it; on probe success, move it back.
+type QuotaPark struct {
+	// Enabled toggles the feature globally. Default false (no-op when false).
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Directory is the parking subdirectory under the auth dir.
+	// Sanitized to disallow path separators or "..". Default ".disabled".
+	Directory string `yaml:"directory" json:"directory"`
+	// Trigger controls when an auth gets parked.
+	Trigger QuotaParkTrigger `yaml:"trigger" json:"trigger"`
+	// Probe controls the active-probe behavior for parked auths.
+	Probe QuotaParkProbe `yaml:"probe" json:"probe"`
+}
+
+// QuotaParkTrigger configures the 429-burst detector for quota-park.
+type QuotaParkTrigger struct {
+	// Window is the rolling window for counting 429 hits. Default "3m".
+	Window string `yaml:"window" json:"window"`
+	// Count is the number of 429 hits within Window that triggers park.
+	// Default 2.
+	Count int `yaml:"count" json:"count"`
+	// GraceAfterUnpark is the grace window after unparking during which
+	// 429s for that authID are ignored to prevent flapping. Default "60s".
+	GraceAfterUnpark string `yaml:"grace-after-unpark" json:"grace-after-unpark"`
+}
+
+// QuotaParkProbe configures the periodic probe for parked auths.
+type QuotaParkProbe struct {
+	// Interval between probes for a single parked auth. Default "5m".
+	Interval string `yaml:"interval" json:"interval"`
+	// Prompt is the user message body for the probe. Default "Say hi".
+	Prompt string `yaml:"prompt" json:"prompt"`
+	// MaxOutputTokens caps probe output. Default 1.
+	MaxOutputTokens int `yaml:"max-output-tokens" json:"max-output-tokens"`
+	// Model overrides the probe model. Default "gpt-5-codex-mini" (codex).
+	Model string `yaml:"model" json:"model"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -740,6 +784,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	// Apply quota-park defaults and sanitize fields.
+	cfg.ApplyQuotaParkDefaults()
+
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.
 	// Re-enable the block below if automatic startup migration is needed again.
@@ -836,6 +883,56 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
 	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
+}
+
+// ApplyQuotaParkDefaults fills in default values and sanitizes the QuotaPark
+// configuration block. Invalid duration strings are reset to defaults with a
+// warning rather than failing the load.
+func (cfg *Config) ApplyQuotaParkDefaults() {
+	qp := &cfg.QuotaPark
+
+	// Directory: must be a single path segment, no separators or "..".
+	qp.Directory = strings.TrimSpace(qp.Directory)
+	if qp.Directory == "" {
+		qp.Directory = ".disabled"
+	} else if strings.ContainsAny(qp.Directory, `/\`) || qp.Directory == ".." || strings.Contains(qp.Directory, "..") {
+		qp.Directory = ".disabled"
+	}
+
+	// Trigger.Window
+	qp.Trigger.Window = strings.TrimSpace(qp.Trigger.Window)
+	if qp.Trigger.Window == "" {
+		qp.Trigger.Window = "3m"
+	}
+	// Trigger.Count
+	if qp.Trigger.Count <= 0 {
+		qp.Trigger.Count = 2
+	}
+	// Trigger.GraceAfterUnpark
+	qp.Trigger.GraceAfterUnpark = strings.TrimSpace(qp.Trigger.GraceAfterUnpark)
+	if qp.Trigger.GraceAfterUnpark == "" {
+		qp.Trigger.GraceAfterUnpark = "60s"
+	}
+
+	// Probe.Interval
+	qp.Probe.Interval = strings.TrimSpace(qp.Probe.Interval)
+	if qp.Probe.Interval == "" {
+		qp.Probe.Interval = "5m"
+	}
+	// Probe.Prompt
+	qp.Probe.Prompt = strings.TrimSpace(qp.Probe.Prompt)
+	if qp.Probe.Prompt == "" {
+		qp.Probe.Prompt = "Say hi"
+	}
+	// Probe.MaxOutputTokens
+	if qp.Probe.MaxOutputTokens <= 0 {
+		qp.Probe.MaxOutputTokens = 1
+	}
+	// Probe.Model
+	qp.Probe.Model = strings.TrimSpace(qp.Probe.Model)
+	if qp.Probe.Model == "" {
+		qp.Probe.Model = "gpt-5-codex-mini"
+	}
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.

@@ -49,6 +49,16 @@ type Builder struct {
 
 	// serverOptions contains additional server configuration options.
 	serverOptions []api.ServerOption
+
+	// coreHook is an optional hook installed on the core auth manager. When set,
+	// it replaces the default NoopHook so external packages (e.g. quotapark)
+	// can observe quota-exceeded and success events.
+	coreHook coreauth.Hook
+
+	// authRestoredCallback is forwarded to the watcher and fires when an auth
+	// file is added or updated under the auth directory. Used by quotapark to
+	// detect manual or probe-driven restores.
+	authRestoredCallback func(authID string)
 }
 
 // Hooks allows callers to plug into service lifecycle stages.
@@ -156,6 +166,22 @@ func (b *Builder) WithLocalManagementPassword(password string) *Builder {
 
 // WithPostAuthHook registers a hook to be called after an Auth record is created
 // but before it is persisted to storage.
+// WithCoreHook installs hook on the core auth manager. The hook receives
+// auth lifecycle events including OnQuotaExceeded and OnAuthSuccess. When
+// nil, the manager keeps its default NoopHook.
+func (b *Builder) WithCoreHook(hook coreauth.Hook) *Builder {
+	b.coreHook = hook
+	return b
+}
+
+// WithAuthRestoredCallback registers a callback invoked whenever an auth file
+// is added or updated under the watched auth directory. Used by quotapark to
+// react to operator-driven or probe-driven restores. Passing nil clears.
+func (b *Builder) WithAuthRestoredCallback(cb func(authID string)) *Builder {
+	b.authRestoredCallback = cb
+	return b
+}
+
 func (b *Builder) WithPostAuthHook(hook coreauth.PostAuthHook) *Builder {
 	if hook == nil {
 		return b
@@ -237,7 +263,12 @@ func (b *Builder) Build() (*Service, error) {
 			})
 		}
 
-		coreManager = coreauth.NewManager(tokenStore, selector, nil)
+		coreManager = coreauth.NewManager(tokenStore, selector, b.coreHook)
+	}
+	// If a coreHook was provided but the coreManager was supplied externally
+	// (via WithCoreAuthManager), still install the hook explicitly.
+	if b.coreHook != nil {
+		coreManager.SetHook(b.coreHook)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
@@ -245,16 +276,17 @@ func (b *Builder) Build() (*Service, error) {
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
 
 	service := &Service{
-		cfg:            b.cfg,
-		configPath:     b.configPath,
-		tokenProvider:  tokenProvider,
-		apiKeyProvider: apiKeyProvider,
-		watcherFactory: watcherFactory,
-		hooks:          b.hooks,
-		authManager:    authManager,
-		accessManager:  accessManager,
-		coreManager:    coreManager,
-		serverOptions:  append([]api.ServerOption(nil), b.serverOptions...),
+		cfg:                  b.cfg,
+		configPath:           b.configPath,
+		tokenProvider:        tokenProvider,
+		apiKeyProvider:       apiKeyProvider,
+		watcherFactory:       watcherFactory,
+		hooks:                b.hooks,
+		authManager:          authManager,
+		accessManager:        accessManager,
+		coreManager:          coreManager,
+		serverOptions:        append([]api.ServerOption(nil), b.serverOptions...),
+		authRestoredCallback: b.authRestoredCallback,
 	}
 	return service, nil
 }

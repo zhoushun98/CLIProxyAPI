@@ -42,6 +42,7 @@ type Watcher struct {
 	serverUpdatePend  bool
 	stopped           atomic.Bool
 	reloadCallback    func(*config.Config)
+	authRestoredCb    func(authID string)
 	watcher           *fsnotify.Watcher
 	lastAuthHashes    map[string]string
 	lastAuthContents  map[string]*coreauth.Auth
@@ -128,6 +129,18 @@ func (w *Watcher) Stop() error {
 	w.stopConfigReloadTimer()
 	w.stopServerUpdateTimer()
 	return w.watcher.Close()
+}
+
+// SetAuthRestoredCallback registers a callback invoked once per authID whenever
+// an auth file is added or updated under the watched auth directory. Callers
+// (e.g. quotapark) use this to detect when an auth they previously moved to a
+// parking dir is restored — either by their own probe-driven unpark or by a
+// manual operator action — and to drop their internal record accordingly.
+// Passing nil clears the callback.
+func (w *Watcher) SetAuthRestoredCallback(cb func(authID string)) {
+	w.clientsMutex.Lock()
+	w.authRestoredCb = cb
+	w.clientsMutex.Unlock()
 }
 
 // SetConfig updates the current configuration

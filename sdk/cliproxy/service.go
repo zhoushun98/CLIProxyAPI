@@ -75,6 +75,12 @@ type Service struct {
 	// watcherCancel cancels the watcher context.
 	watcherCancel context.CancelFunc
 
+	// authRestoredCallback, if set, is invoked when an auth file is added or
+	// updated under the auth directory. It is installed on the watcher right
+	// before the watcher starts (so the very first registration emits an
+	// event). Used by quotapark to react to manual / probe-driven restores.
+	authRestoredCallback func(authID string)
+
 	// authUpdates channel for authentication updates.
 	authUpdates chan watcher.AuthUpdate
 
@@ -919,6 +925,9 @@ func (s *Service) Run(ctx context.Context) error {
 			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
 		}
 		watcherWrapper.SetConfig(s.cfg)
+		if s.authRestoredCallback != nil {
+			watcherWrapper.SetAuthRestoredCallback(s.authRestoredCallback)
+		}
 
 		watcherCtx, watcherCancel := context.WithCancel(context.Background())
 		s.watcherCancel = watcherCancel

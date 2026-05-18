@@ -12,9 +12,25 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/quotapark"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
 )
+
+// buildQuotaParkService constructs the quotapark Service when enabled in cfg
+// and returns nil otherwise. RebuildFromDisk is invoked here so a process
+// restart resumes probing of previously parked files.
+func buildQuotaParkService(cfg *config.Config) *quotapark.Service {
+	if cfg == nil || !cfg.QuotaPark.Enabled {
+		return nil
+	}
+	probe := quotapark.NewCodexProber(cfg)
+	svc := quotapark.New(cfg, probe.Probe)
+	if err := svc.RebuildFromDisk(); err != nil {
+		log.Warnf("quota-park: rebuild from disk failed: %v", err)
+	}
+	return svc
+}
 
 // StartService builds and runs the proxy service using the exported SDK.
 // It creates a new proxy service instance, sets up signal handling for graceful shutdown,
@@ -29,6 +45,13 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 		WithConfig(cfg).
 		WithConfigPath(configPath).
 		WithLocalManagementPassword(localPassword)
+
+	quotaParkSvc := buildQuotaParkService(cfg)
+	if quotaParkSvc != nil {
+		builder = builder.
+			WithCoreHook(quotaParkSvc.Hook()).
+			WithAuthRestoredCallback(quotaParkSvc.NoticeRestored)
+	}
 
 	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -49,6 +72,11 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 		return
 	}
 
+	if quotaParkSvc != nil {
+		quotaParkSvc.Start(runCtx)
+		defer quotaParkSvc.Stop()
+	}
+
 	err = service.Run(runCtx)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Errorf("proxy service exited with error: %v", err)
@@ -63,6 +91,13 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 		WithConfigPath(configPath).
 		WithLocalManagementPassword(localPassword)
 
+	quotaParkSvc := buildQuotaParkService(cfg)
+	if quotaParkSvc != nil {
+		builder = builder.
+			WithCoreHook(quotaParkSvc.Hook()).
+			WithAuthRestoredCallback(quotaParkSvc.NoticeRestored)
+	}
+
 	ctx, cancelFn := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
 
@@ -73,8 +108,15 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 		return cancelFn, doneCh
 	}
 
+	if quotaParkSvc != nil {
+		quotaParkSvc.Start(ctx)
+	}
+
 	go func() {
 		defer close(doneCh)
+		if quotaParkSvc != nil {
+			defer quotaParkSvc.Stop()
+		}
 		if err := service.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Errorf("proxy service exited with error: %v", err)
 		}

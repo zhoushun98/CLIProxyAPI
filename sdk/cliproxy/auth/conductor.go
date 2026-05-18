@@ -128,6 +128,13 @@ type Hook interface {
 	OnAuthUpdated(ctx context.Context, auth *Auth)
 	// OnResult fires when execution result is recorded.
 	OnResult(ctx context.Context, result Result)
+	// OnQuotaExceeded fires after MarkResult observed an HTTP 429 for an Auth,
+	// gated by the conductor's cooldown logic (disable_cooling auths are skipped).
+	// Implementations must be non-blocking.
+	OnQuotaExceeded(ctx context.Context, authID, provider, model string, at time.Time)
+	// OnAuthSuccess fires when an Auth completes a successful request.
+	// Implementations must be non-blocking.
+	OnAuthSuccess(ctx context.Context, authID string)
 }
 
 // NoopHook provides optional hook defaults.
@@ -141,6 +148,12 @@ func (NoopHook) OnAuthUpdated(context.Context, *Auth) {}
 
 // OnResult implements Hook.
 func (NoopHook) OnResult(context.Context, Result) {}
+
+// OnQuotaExceeded implements Hook.
+func (NoopHook) OnQuotaExceeded(context.Context, string, string, string, time.Time) {}
+
+// OnAuthSuccess implements Hook.
+func (NoopHook) OnAuthSuccess(context.Context, string) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
@@ -182,6 +195,16 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+}
+
+// SetHook replaces the manager's lifecycle hook. Passing nil installs the
+// NoopHook. Safe to call before goroutines are started; concurrent use during
+// MarkResult is not synchronized.
+func (m *Manager) SetHook(hook Hook) {
+	if hook == nil {
+		hook = NoopHook{}
+	}
+	m.hook = hook
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -2291,6 +2314,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+
+	// quotapark integration: notify hook of quota-exceeded (already gated by
+	// disableCooling above via setModelQuota), and auth success.
+	if result.AuthID != "" {
+		if setModelQuota {
+			m.hook.OnQuotaExceeded(ctx, result.AuthID, result.Provider, result.Model, time.Now())
+		}
+		if result.Success {
+			m.hook.OnAuthSuccess(ctx, result.AuthID)
+		}
+	}
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

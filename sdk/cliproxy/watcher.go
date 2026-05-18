@@ -31,5 +31,8 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 		dispatchRuntimeUpdate: func(update watcher.AuthUpdate) bool {
 			return w.DispatchRuntimeAuthUpdate(update)
 		},
+		setAuthRestoredCb: func(cb func(authID string)) {
+			w.SetAuthRestoredCallback(cb)
+		},
 	}, nil
 }
