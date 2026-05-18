@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
@@ -26,6 +27,14 @@ const codexProbeEndpoint = "https://chatgpt.com/backend-api/codex/responses"
 // codexProbeRefreshSkew is the minimum lifetime remaining on the access token
 // before a refresh is forced. Keeping it small avoids refreshing on every probe.
 const codexProbeRefreshSkew = 2 * time.Minute
+
+// codexProbeOriginator is the originator string the upstream expects to see for
+// codex_cli_rs (mirrors the value in codex_executor.go).
+const codexProbeOriginator = "codex_cli_rs"
+
+// codexProbeFallbackUA mirrors the codexUserAgent fallback in codex_executor.go
+// to make probe requests indistinguishable from the regular cli traffic.
+const codexProbeFallbackUA = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
 
 // codexAuthFile is the minimal subset of the on-disk JSON the probe needs.
 // Other fields are ignored.
@@ -130,12 +139,21 @@ func (p *CodexProber) Probe(ctx context.Context, info ParkedInfo) (ProbeResult, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Connection", "Keep-Alive")
 	req.Header.Set("Authorization", "Bearer "+access)
+	req.Header.Set("Originator", codexProbeOriginator)
 	if af.AccountID != "" {
-		req.Header.Set("chatgpt-account-id", af.AccountID)
+		req.Header.Set("Chatgpt-Account-Id", af.AccountID)
 	}
-	if ua := strings.TrimSpace(p.cfg.CodexHeaderDefaults.UserAgent); ua != "" {
-		req.Header.Set("User-Agent", ua)
+	ua := strings.TrimSpace(p.cfg.CodexHeaderDefaults.UserAgent)
+	if ua == "" {
+		ua = codexProbeFallbackUA
+	}
+	req.Header.Set("User-Agent", ua)
+	// The codex executor includes a fresh Session_id when the user-agent looks
+	// like the codex_cli_rs Mac variant; mirror that to stay indistinguishable.
+	if strings.Contains(ua, "Mac OS") {
+		req.Header.Set("Session_id", uuid.NewString())
 	}
 	if betas := strings.TrimSpace(p.cfg.CodexHeaderDefaults.BetaFeatures); betas != "" {
 		req.Header.Set("OpenAI-Beta", betas)
@@ -146,46 +164,64 @@ func (p *CodexProber) Probe(ctx context.Context, info ParkedInfo) (ProbeResult, 
 	if err != nil {
 		return ProbeError, fmt.Errorf("http do: %w", err)
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
+	defer func() { _ = resp.Body.Close() }()
 
-	switch {
-	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return ProbeRecovered, nil
-	case resp.StatusCode == http.StatusTooManyRequests:
-		return ProbeStillExhausted, nil
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return ProbeAuthError, fmt.Errorf("upstream returned %d", resp.StatusCode)
-	default:
-		return ProbeError, fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return ProbeStillExhausted, nil
+	}
+
+	// On error responses surface the upstream body to make diagnosis possible.
+	// Cap at 256 bytes so a misbehaving upstream cannot fill the log.
+	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	bodyHint := strings.TrimSpace(string(snippet))
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return ProbeAuthError, fmt.Errorf("upstream returned %d body=%q", resp.StatusCode, bodyHint)
+	}
+	return ProbeError, fmt.Errorf("upstream returned %d body=%q", resp.StatusCode, bodyHint)
 }
 
 // buildBody returns the minimal Codex responses-API request payload.
+//
+// The shape mirrors what internal/translator/codex emits for normal traffic:
+// every entry in the input array must carry "type":"message" plus role and a
+// content array of "input_text" segments, and the top-level body must include
+// instructions (may be empty). Without these fields the upstream returns 400.
 func (p *CodexProber) buildBody() []byte {
 	type inputContent struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}
 	type inputMessage struct {
+		Type    string         `json:"type"`
 		Role    string         `json:"role"`
 		Content []inputContent `json:"content"`
 	}
+	type reasoning struct {
+		Effort string `json:"effort"`
+	}
 	type reqBody struct {
 		Model           string         `json:"model"`
+		Instructions    string         `json:"instructions"`
 		Input           []inputMessage `json:"input"`
+		Reasoning       reasoning      `json:"reasoning"`
 		MaxOutputTokens int            `json:"max_output_tokens"`
 		Store           bool           `json:"store"`
 		Stream          bool           `json:"stream"`
 	}
 	b := reqBody{
-		Model: p.model,
+		Model:        p.model,
+		Instructions: "",
 		Input: []inputMessage{{
+			Type:    "message",
 			Role:    "user",
 			Content: []inputContent{{Type: "input_text", Text: p.prompt}},
 		}},
+		Reasoning:       reasoning{Effort: "minimal"},
 		MaxOutputTokens: p.maxTok,
 		Store:           false,
 		Stream:          false,
