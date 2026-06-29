@@ -185,6 +185,44 @@ codex:
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
 
+  # Auth-guard governs automatic disable/delete behavior for Codex auth files
+  # in response to persistent upstream failures. All knobs default to safe values
+  # that preserve the legacy "cooldown only" behavior; the persistent-disable and
+  # auto-delete behavior must be opted in explicitly.
+  auth-guard:
+    # When true, a 429 (quota exhausted) marks the credential auth.Disabled=true
+    # on disk so the management UI shows it as offline and the selector skips it.
+    # When false (default), only the existing in-memory cooldown applies.
+    disable-on-quota-exhausted: false
+    # How a disabled-by-429 credential is recovered:
+    #   "resets-at" (default): a background sweeper re-enables the credential once
+    #     the OpenAI-supplied reset window elapses (parsed from error.resets_at /
+    #     error.resets_in_seconds).
+    #   "manual": the credential stays disabled until an operator clears it via
+    #     the management API (ResetQuota).
+    quota-recovery-mode: resets-at
+    # Cadence at which the recovery sweeper checks for expired disable windows.
+    # Only takes effect at startup; runtime changes require restart.
+    recovery-sweep-interval: 30s
+    # When true, the manager attempts a refresh-token exchange on 401 to tell
+    # transient access-token expiry apart from a truly revoked credential.
+    # A successful probe clears the 401 cooldown immediately (so the credential
+    # is eligible for the next request) without affecting the legacy failure
+    # counters or the error-events queue — the upstream 401 still counts as a
+    # failure for monitoring. Default false because the probe is synchronous
+    # and adds OAuth-server RTT to the failing request; enable it only if
+    # short-cooldown turnaround is more important than tail latency.
+    refresh-before-unauthorized: false
+    # When true, a credential file is deleted from disk (and from any configured
+    # store backend: file / postgres / git / object store) after the unauthorized
+    # streak threshold is reached. Defaults to false to avoid accidental deletion.
+    delete-on-unauthorized: false
+    # Number of consecutive 401 + refresh-failed responses required before deletion.
+    unauthorized-streak-threshold: 3
+    # Rolling window within which streak counts accumulate. Older failures reset
+    # the streak. Any successful 2xx response also resets the streak.
+    unauthorized-streak-window: 10m
+
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 

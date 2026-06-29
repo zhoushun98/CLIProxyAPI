@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // OAuthError represents an OAuth-specific error.
@@ -14,16 +15,54 @@ type OAuthError struct {
 	Description string `json:"error_description,omitempty"`
 	// URI is a URI identifying a human-readable web page with information about the error.
 	URI string `json:"error_uri,omitempty"`
-	// StatusCode is the HTTP status code associated with the error.
-	StatusCode int `json:"-"`
+	// HTTPStatus is the HTTP status code associated with the error. The field is
+	// named HTTPStatus (not StatusCode) so the type can also expose a StatusCode()
+	// method below — needed by sdk/cliproxy/auth/conductor.go's statusCoder
+	// interface for HTTP-aware error classification.
+	HTTPStatus int `json:"-"`
+	// RawBody preserves the original response body for diagnostic logs, capped to
+	// a small size so a misbehaving upstream cannot blow up memory.
+	RawBody string `json:"-"`
 }
 
-// Error returns a string representation of the OAuth error.
+// Error returns a string representation of the OAuth error. The format keeps
+// the HTTP status code and either the structured description or a truncated
+// raw body so an operator reading LastError.Message can triage non-401
+// refresh failures without having to inspect upstream OAuth logs.
 func (e *OAuthError) Error() string {
-	if e.Description != "" {
-		return fmt.Sprintf("OAuth error %s: %s", e.Code, e.Description)
+	if e == nil {
+		return ""
 	}
-	return fmt.Sprintf("OAuth error: %s", e.Code)
+	var b strings.Builder
+	b.WriteString("OAuth error")
+	if e.HTTPStatus > 0 {
+		fmt.Fprintf(&b, " (status %d)", e.HTTPStatus)
+	}
+	if e.Code != "" {
+		b.WriteString(": ")
+		b.WriteString(e.Code)
+	}
+	switch {
+	case e.Description != "":
+		b.WriteString(": ")
+		b.WriteString(e.Description)
+	case e.RawBody != "":
+		b.WriteString(": ")
+		b.WriteString(e.RawBody)
+	}
+	return b.String()
+}
+
+// StatusCode satisfies the SDK-side statusCoder interface
+// (sdk/cliproxy/auth/conductor.go's statusCodeFromError). Without this method,
+// refresh-token failures returning *OAuthError would be classified as
+// "unknown status" by the auto-refresh loop, defeating the unauthorized-skip
+// logic in hasUnauthorizedAuthFailure.
+func (e *OAuthError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.HTTPStatus
 }
 
 // NewOAuthError creates a new OAuth error with the specified code, description, and status code.
@@ -31,7 +70,7 @@ func NewOAuthError(code, description string, statusCode int) *OAuthError {
 	return &OAuthError{
 		Code:        code,
 		Description: description,
-		StatusCode:  statusCode,
+		HTTPStatus:  statusCode,
 	}
 }
 

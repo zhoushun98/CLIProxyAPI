@@ -5,8 +5,10 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -239,6 +241,14 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// Attempt to parse a structured OAuth error body so callers can distinguish
+		// "refresh_token genuinely revoked" (invalid_grant / refresh_token_reused /
+		// invalid_request / unauthorized_client) from transient HTTP failures. The
+		// returned *OAuthError still carries the raw status code and description for
+		// log fidelity.
+		if oauthErr := parseOAuthErrorBody(body, resp.StatusCode); oauthErr != nil {
+			return nil, oauthErr
+		}
 		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -325,12 +335,84 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 	return nil, fmt.Errorf("token refresh failed after %d attempts: %w", maxRetries, lastErr)
 }
 
+// IsNonRetryableRefreshErr reports whether err describes a refresh-token failure
+// that must not be retried — i.e. the credential has been revoked or rejected by
+// the OAuth server. Exported so sdk/cliproxy/auth's codex_guard can classify
+// refresh probes without duplicating the parsing rules.
+func IsNonRetryableRefreshErr(err error) bool {
+	return isNonRetryableRefreshErr(err)
+}
+
 func isNonRetryableRefreshErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Prefer the structured OAuth error code when available — it survives wrapping
+	// via fmt.Errorf("%w", ...) and is far less fragile than substring matching.
+	//
+	// Note: invalid_request is intentionally NOT in this list. RFC 6749 §5.2
+	// defines invalid_request as a protocol-level error that may signal a
+	// transient server-side issue (mis-formed handler, partial outage), not a
+	// revoked credential — auto-deleting credentials on invalid_request would
+	// risk wiping the auths/ directory during a recoverable upstream blip.
+	if code := oauthErrorCode(err); code != "" {
+		switch code {
+		case "invalid_grant",
+			"refresh_token_reused",
+			"unauthorized_client",
+			"invalid_client":
+			return true
+		}
+		// Fall through to substring fallback rather than returning false: a
+		// future OAuth server might wrap a true revocation inside a code we
+		// don't yet recognize (e.g. "error":"server_error","error_description":
+		// "refresh_token_reused encountered"), and the substring check is
+		// our safety net.
+	}
+	// Fallback for legacy error messages that don't carry a structured code (e.g.
+	// raw string-formatted refresh failures from before parseOAuthErrorBody existed),
+	// or for unfamiliar OAuth codes that still embed a known revocation phrase.
 	raw := strings.ToLower(err.Error())
-	return strings.Contains(raw, "refresh_token_reused")
+	return strings.Contains(raw, "refresh_token_reused") ||
+		strings.Contains(raw, "invalid_grant")
+}
+
+// parseOAuthErrorBody tries to decode a TokenURL error body into an *OAuthError.
+// Returns nil when the body is empty, not JSON, or lacks the canonical "error"
+// field — letting callers fall back to a generic error message that preserves
+// the full status + body in the error string.
+func parseOAuthErrorBody(body []byte, statusCode int) *OAuthError {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 || body[0] != '{' {
+		return nil
+	}
+	var oauthErr OAuthError
+	if err := json.Unmarshal(body, &oauthErr); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(oauthErr.Code) == "" {
+		return nil
+	}
+	oauthErr.HTTPStatus = statusCode
+	// Preserve the raw body for diagnostic logs. Cap at a small ceiling so a
+	// pathological upstream cannot inflate per-error memory.
+	const maxRawBody = 512
+	if len(body) > maxRawBody {
+		oauthErr.RawBody = string(body[:maxRawBody]) + "...(truncated)"
+	} else {
+		oauthErr.RawBody = string(body)
+	}
+	return &oauthErr
+}
+
+// oauthErrorCode returns the OAuth error code of err when err (or any wrapped
+// error in its chain) is an *OAuthError. Returns "" otherwise.
+func oauthErrorCode(err error) string {
+	var oauthErr *OAuthError
+	if errors.As(err, &oauthErr) && oauthErr != nil {
+		return strings.TrimSpace(oauthErr.Code)
+	}
+	return ""
 }
 
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.

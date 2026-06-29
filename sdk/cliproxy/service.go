@@ -1765,6 +1765,19 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+
+		// Codex auth-guard cooldown recovery sweeper. The interval is read once
+		// at startup; changing config.codex.auth-guard.recovery-sweep-interval
+		// requires a restart to take effect. The other guard knobs (disable/
+		// delete/refresh toggles, streak threshold/window) are read on every
+		// MarkResult call and DO hot-reload via the existing config watcher.
+		sweepInterval := time.Duration(0)
+		if cfg := s.cfg; cfg != nil {
+			if d, err := time.ParseDuration(strings.TrimSpace(cfg.Codex.AuthGuard.RecoverySweepInterval)); err == nil {
+				sweepInterval = d
+			}
+		}
+		s.coreManager.StartCooldownRecoveryLoop(context.Background(), sweepInterval)
 	}
 
 	select {
@@ -1816,6 +1829,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
+			s.coreManager.StopCooldownRecoveryLoop()
 		}
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {

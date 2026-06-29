@@ -29,6 +29,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/sjson"
+	"golang.org/x/sync/singleflight"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -257,6 +258,15 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+
+	// Codex auth-guard state (see codex_guard.go / cooldown_recovery_loop.go).
+	// codexRefreshGroup deduplicates concurrent 401-triggered refresh probes per
+	// auth ID so a burst of failing requests against the same credential only
+	// issues a single refresh-token exchange.
+	codexRefreshGroup singleflight.Group
+	// cooldownRecoveryCancel cancels the background sweeper that re-enables
+	// credentials whose 429 disable window has elapsed.
+	cooldownRecoveryCancel context.CancelFunc
 
 	requestPrepareLocks sync.Map
 }
@@ -3498,6 +3508,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		return
 	}
 
+	// Codex auth-guard: probe refresh-token on 401 BEFORE the legacy bookkeeping
+	// runs, so that on success the manager can clear this auth's 30-minute
+	// cooldown in the same MarkResult pass. The result itself is NOT mutated —
+	// upstream still returned 401, so Failed counters, OnResult, the error
+	// events queue, and the recent-request rolling window all observe the real
+	// outcome. Only the cooldown / streak state on the in-memory auth diverges,
+	// and only as a corrective post-step in applyCodexGuardPost.
+	var codexProbe codexRefreshProbeOutcome
+	resultStatusCode := statusCodeFromResult(result.Error)
+	if isCodexResult(result) && !result.Success && resultStatusCode == http.StatusUnauthorized {
+		codexProbe = m.runCodexRefreshProbe(ctx, result.AuthID)
+	}
+
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
@@ -3676,6 +3699,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+
+	// Codex auth-guard post-processing: opt-in 429 persistent disable + 401
+	// streak-then-delete. Runs after the legacy bookkeeping so disable/delete
+	// observes the freshly-updated auth state, and stays outside the manager
+	// lock so file I/O does not block other requests.
+	if isCodexResult(result) {
+		m.applyCodexGuardPost(ctx, result, codexProbe, resultStatusCode)
+	}
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

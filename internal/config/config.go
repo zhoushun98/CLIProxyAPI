@@ -277,6 +277,47 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+
+	// AuthGuard configures automatic disable-on-429 and delete-on-401 behavior
+	// for Codex authentication credentials. All knobs default to safe values that
+	// preserve the legacy behavior (cooldown only, no persistent disable, no delete).
+	AuthGuard CodexAuthGuardConfig `yaml:"auth-guard,omitempty" json:"auth-guard,omitempty"`
+}
+
+// CodexAuthGuardConfig controls automatic guardrails applied to Codex credentials
+// when the upstream returns persistent quota or unauthorized failures.
+//
+// 429 path (quota exhausted): when DisableOnQuotaExhausted is true, the credential's
+// Disabled flag is persisted to disk and the credential is hidden from selector
+// rotation. QuotaRecoveryMode chooses between "resets-at" (auto-enable when the
+// OpenAI-supplied reset window elapses) and "manual" (require operator action).
+//
+// 401 path (unauthorized): when RefreshBeforeUnauthorized is true, the manager
+// first attempts a refresh-token exchange to differentiate transient access-token
+// expiry from a truly revoked credential. Only refresh failures with a structured
+// OAuth error code (invalid_grant / refresh_token_reused / invalid_request) count
+// toward the unauthorized streak. When DeleteOnUnauthorized is true and the
+// streak reaches UnauthorizedStreakThreshold within UnauthorizedStreakWindow,
+// the credential file is removed from disk and the in-memory entry is evicted.
+type CodexAuthGuardConfig struct {
+	// DisableOnQuotaExhausted toggles persistent disable on 429 responses.
+	DisableOnQuotaExhausted bool `yaml:"disable-on-quota-exhausted,omitempty" json:"disable-on-quota-exhausted,omitempty"`
+	// QuotaRecoveryMode selects the recovery strategy for credentials disabled by 429.
+	// Accepted values: "resets-at" (default) or "manual".
+	QuotaRecoveryMode string `yaml:"quota-recovery-mode,omitempty" json:"quota-recovery-mode,omitempty"`
+	// RecoverySweepInterval is the cadence at which the background sweeper checks
+	// for expired disable windows. Parsed via time.ParseDuration. Default: "30s".
+	RecoverySweepInterval string `yaml:"recovery-sweep-interval,omitempty" json:"recovery-sweep-interval,omitempty"`
+	// RefreshBeforeUnauthorized toggles the refresh-token probe on 401 responses.
+	RefreshBeforeUnauthorized bool `yaml:"refresh-before-unauthorized,omitempty" json:"refresh-before-unauthorized,omitempty"`
+	// DeleteOnUnauthorized toggles automatic credential file deletion after repeated 401 failures.
+	DeleteOnUnauthorized bool `yaml:"delete-on-unauthorized,omitempty" json:"delete-on-unauthorized,omitempty"`
+	// UnauthorizedStreakThreshold is the number of consecutive unauthorized failures
+	// (with refresh probe also failing structurally) required before deletion. Default: 3.
+	UnauthorizedStreakThreshold int `yaml:"unauthorized-streak-threshold,omitempty" json:"unauthorized-streak-threshold,omitempty"`
+	// UnauthorizedStreakWindow is the rolling window within which streak counts accumulate.
+	// Failures older than this window reset the streak. Parsed via time.ParseDuration. Default: "10m".
+	UnauthorizedStreakWindow string `yaml:"unauthorized-streak-window,omitempty" json:"unauthorized-streak-window,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -721,6 +762,15 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	// Codex auth-guard defaults preserve current behavior. Every toggle is
+	// opt-in (default false / zero) so deploying this binary with an existing
+	// config file is a no-op until an operator explicitly enables a guard
+	// behavior. Non-bool defaults below only kick in when the matching toggle
+	// is later enabled.
+	cfg.Codex.AuthGuard.QuotaRecoveryMode = "resets-at"
+	cfg.Codex.AuthGuard.RecoverySweepInterval = "30s"
+	cfg.Codex.AuthGuard.UnauthorizedStreakThreshold = 3
+	cfg.Codex.AuthGuard.UnauthorizedStreakWindow = "10m"
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.

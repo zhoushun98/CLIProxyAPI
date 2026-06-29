@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -44,11 +45,87 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error for non-retryable refresh failure")
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "refresh_token_reused") {
-		t.Fatalf("expected refresh_token_reused in error, got: %v", err)
+	// After structured OAuth error parsing, the error message is OAuthError.Error()
+	// ("OAuth error invalid_grant" — Description is empty) rather than the raw
+	// JSON body. The non-retryable classification must be done via the typed
+	// helper, which is what callers (RefreshTokensWithRetry, codex_guard) use.
+	if !IsNonRetryableRefreshErr(err) {
+		t.Fatalf("expected non-retryable classification, got err=%v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("expected 1 refresh attempt, got %d", got)
+	}
+}
+
+func TestRefreshTokens_StructuredOAuthErrorOnInvalidGrant(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	t.Cleanup(resetCodexRefreshGroupForTest)
+
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant","error_description":"refresh token revoked"}`)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	_, err := auth.RefreshTokens(context.Background(), "dummy-refresh")
+	if err == nil {
+		t.Fatal("expected error from refresh with invalid_grant body")
+	}
+	var oauthErr *OAuthError
+	if !errors.As(err, &oauthErr) || oauthErr == nil {
+		t.Fatalf("expected *OAuthError in error chain, got %T: %v", err, err)
+	}
+	if oauthErr.Code != "invalid_grant" {
+		t.Fatalf("OAuthError.Code = %q, want invalid_grant", oauthErr.Code)
+	}
+	if oauthErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("OAuthError.HTTPStatus = %d, want 400", oauthErr.HTTPStatus)
+	}
+	if oauthErr.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("OAuthError.StatusCode() = %d, want 400", oauthErr.StatusCode())
+	}
+	if !IsNonRetryableRefreshErr(err) {
+		t.Fatal("invalid_grant must be classified as non-retryable")
+	}
+}
+
+func TestRefreshTokens_FallbackToOpaqueErrorOnNonJSONBody(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	t.Cleanup(resetCodexRefreshGroupForTest)
+
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Body:       io.NopCloser(strings.NewReader("upstream timeout — please retry")),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	_, err := auth.RefreshTokens(context.Background(), "dummy-refresh")
+	if err == nil {
+		t.Fatal("expected error from refresh with 503 body")
+	}
+	var oauthErr *OAuthError
+	if errors.As(err, &oauthErr) {
+		t.Fatalf("non-JSON body must not be coerced into OAuthError, got %v", oauthErr)
+	}
+	if IsNonRetryableRefreshErr(err) {
+		t.Fatal("transient (non-OAuth) errors must NOT be classified non-retryable")
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Fatalf("expected status code in fallback error, got: %v", err)
 	}
 }
 
